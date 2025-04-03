@@ -4,16 +4,16 @@ from .color import get_hex_index
 
 class ImageReader:
 
-
     def __init__(self, image_path):
         self.image_path = image_path
         self.width = None
         self.height = None
-
     
     def read_image(self):
         image = Image.open(self.image_path)
 
+        if image .mode not in ['RGBA', 'RGB']:
+            image = image.convert('RGBA')
 
         pixels = image.load()
 
@@ -34,3 +34,8 @@ class ImageReader:
                 output[x + image.size[0] * (y // 2)] = Pixel(x, y // 2, bg, fg, "▀")
 
         return output
+
+
+# reader = ImageReader('../images/brandejs20.png')
+
+# reader.read_image()

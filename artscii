@@ -1,0 +1,693 @@
+#!/usr/bin/env perl
+use Cwd 'abs_path';
+use File::Basename;
+
+# Get the absolute path of the script's directory
+my $script_dir = dirname(abs_path($0));
+
+# Change to that directory
+chdir($script_dir) or die "Cannot change directory to $script_dir: $!\n";
+
+use v5.40;
+
+use utf8;
+use open ':std', ':encoding(utf-8)';
+
+use FindBin qw{$RealBin};
+use lib "$RealBin/lib";
+
+=encoding utf-8
+
+=head1 NAME
+
+C<artscii> -- Artscii Client
+
+=head1 SYNOPSIS
+
+    artscii [--connect (UNIX|HOST:PORT)] COMMAND [OPTIONS]
+
+    artscii [help|-h|--help|--man]    Show manual
+    artscii show                      Print the canvas
+    artscii put PLACE BG [FG CHAR]    Paint a pixel
+    artscii watch canvas              Show changes to canvas in real time
+    artscii watch changes             Show changes to canvas as text
+    artscii colours                   List available colours
+
+      PLACE                   Position XY or YX, e.g. a0, ca12, 5b, 14a
+      BG FG                   Background and foreground colour
+      CHAR                    A character to put
+
+      -h --help --man         Show documentation
+      -c --connect UNIX       Connect to the UNIX socket
+      -c --connect HOST:PORT  Connect to the network socket
+
+         --no-guides          show: Do not draw position guides
+      -w --wait               put: Wait for the timeout to expire
+      -q --quiet              put: Do not draw the resulting picture
+
+=head1 DESCRIPTION
+
+The position is specified either as C<XY> or C<YX>. The C<X> axis is labeled by
+strings C<a> to <z>, then C<aa>, C<ab> to C<zz> etc., while C<Y> is labeled by
+numbers.
+
+These coordinates denote the top left corner: C<a0>, C<A0>, C<AA00>, C<00AA>.
+
+On 78×22 canvas (the default), these denote the bottom right corner: C<cz21>,
+C<21cz>.
+
+Both background and foreground colour can be specified either as a name
+(use C<artscii colours> to list) or a number in 8-bit VGA colour space.
+To keep either of the colours, use C<->.
+
+=head1 EXAMPLES
+
+Display the canvas:
+
+	artscii show
+
+Put a red X over white background at the top left corner:
+
+	artscii put A0 white red X
+	artscii put 0A white red X
+	artscii put 00aa 15 1 X
+
+Change the background colour of [2, 5] to orange (214):
+
+	arstcii put c5 214
+
+Put a blue C<X> at [1, 1] without changing the background colour:
+
+	artscii put b1 - blue X
+
+Same as above, but do not show the image:
+
+	artscii --quiet put b1 - blue X
+
+Watch the canvas for changes in the canvas:
+
+	artscii watch canvas
+
+Watch the canvas for changes, printing one line per event:
+
+	artscii watch changes
+
+=cut
+
+
+package Static;
+
+sub colours() {
+	my $palette = Canvas::Palette->new;
+
+	say "\e[1mNamed colours\e[0m:";
+
+	my %names = $palette->names;
+	foreach my ($i, $name) (builtin::indexed(sort keys %names)) {
+		my $v = $names{$name};
+		printf "\e[48;5;${v}m  \e[0m\e[38;5;${v}m %-17s\e[0m", $name;
+		print "\n" if $i % 4 == 3 || $i + 1 == keys %names;
+	}
+
+	print "\n";
+
+	say "\e[1mRaw palette colours\e[0m:";
+	my @range = $palette->range;
+	foreach my $i (@range) {
+		printf "\e[48;5;${i}m  \e[0m\e[38;5;${i}m %3d  \e[0m", $i;
+		print "\n" if $i % 10 == 9 || $i == $range[$#range];
+	}
+}
+
+
+package Message;
+
+sub _paint($c, @what) {
+	return (map { "\e[${c}m" . $_ } @what), "\e[0m" if -t 1;
+	return @what;
+}
+
+sub bug(@msg) {
+	say STDERR _paint('1;7;91', 'BUG'), _paint('91', ': ', @msg);
+}
+
+sub usage(@msg) {
+	map { chomp } @msg;
+	say STDERR 'usage: ', @msg;
+	return 1;
+}
+
+sub fatal(@msg) {
+	say STDERR _paint('91', @msg);
+	exit 1;
+}
+
+sub info(@msg) {
+	say STDERR _paint('96', @msg);
+}
+
+sub warn(@msg) {
+	say STDERR _paint('93', @msg);
+}
+
+sub error(@msg) {
+	say STDERR _paint('91', @msg);
+}
+
+
+package Client;
+
+use AnyEvent;
+use Canvas;
+use Coro;
+use DateTime;
+use Encode;
+use JSON::PP;
+use List::Util qw{max reduce};
+use POSIX qw{ceil};
+
+sub _msg_is_ok($data) {
+	return true if !defined $data->{error};
+
+	Message::error($data->{error});
+	return false;
+}
+
+sub _data_to_canvas($data) {
+	my $canvas = Canvas->new($data->{size}->@{qw{width height}});
+
+	$canvas->for_each_pixel(sub ($x, $y, $) {
+		$canvas->set($x, $y, Canvas::Pixel->new($data->{pixels}[$y][$x]->@*));
+	});
+
+	return $canvas;
+}
+
+sub _skips($canvas) {
+	(
+		ceil(log($canvas->{width}) / log(26)),
+		ceil(log($canvas->{height}) / log(10)),
+	)
+}
+
+sub _draw_guides_y($canvas) {
+	my ($xd, $yd) = _skips($canvas);
+
+	my $last = -1;
+	foreach my $place (reverse (0 .. $xd - 1)) {
+		print " " x $yd;
+
+		foreach my $x (0 .. $canvas->{width} - 1) {
+			my $digit = int($x / 26 ** $place) % 26;
+			my $letter = ('A' .. 'Z')[$digit];
+
+			if ($last != $digit) {
+				print "\e[38;5;248m$letter\e[0m";
+			} else {
+				print "\e[38;5;242m$letter\e[0m";
+			}
+
+			$last = $digit;
+		}
+
+		print "\n";
+	}
+}
+
+sub _draw_guides_x($canvas, $y) {
+	my (undef, $yd) = _skips($canvas);
+
+	my $leading_zero = true;
+	foreach my $place (reverse (0 .. $yd - 1)) {
+		my $digit = int($y / 10 ** $place) % 10;
+
+		if ($place > 0 && $digit == 0 && $leading_zero) {
+			print " ";
+			next;
+		}
+
+		$leading_zero = false;
+		if ($place == 0 || $y % (10 ** $place) == 0) {
+			print "\e[38;5;248m$digit\e[0m";
+		} else {
+			print "\e[38;5;242m$digit\e[0m";
+		}
+	}
+}
+
+sub _clrscr() {
+	print "\e[2J\e[;H";
+}
+
+sub _draw_canvas($data, $draw_guides) {
+	my $palette = Canvas::Palette->new;
+
+	if ($::WATCHES->{cb}->{subscribe}) {
+		_clrscr;
+	}
+
+	my $canvas = _data_to_canvas($data);
+	$canvas->scan_pixels(sub ($ev, @data) {
+		my $f = {
+			start => sub ($) {
+				_draw_guides_y($canvas) if $draw_guides;
+			},
+			start_line => sub ($y) {
+				_draw_guides_x($canvas, $y) if $draw_guides;
+			},
+			pixel => sub ($, $, $pixel) {
+				print $pixel->render($palette);
+			},
+			end_line => sub ($) {
+				print "\n";
+			},
+		}->{$ev};
+
+		$f->(@data) if defined $f;
+	});
+}
+
+sub _validate_put($coord, $xbg, $xfg = undef, $xchar = undef) {
+	my ($xy, $err) = Validate::coords($coord);
+
+	if ($err) {
+		Message::error("$coord: $err");
+		return;
+	}
+
+	my @colours;
+	foreach ($xbg, $xfg) {
+		(my $colour, $err) = Validate::colour($_);
+
+		if ($err) {
+			Message::error("$_: $err");
+			return;
+		}
+
+		push @colours, $colour;
+	}
+
+	(my $char, $err) = Validate::char($xchar);
+
+	if ($err) {
+		Message::error("$xchar: $err");
+		return;
+	}
+
+	return ($xy->@*, @colours, $char);
+}
+
+sub _load_canvas($fn) {
+	open my $file, '<:encoding(utf-8)', $fn
+		or die "$fn: $!\n";
+
+	my $in_image = false;
+	my $pixels = {};
+	my $canvas = Canvas->new(1, 1);
+
+	while (my $line = readline $file) {
+		chomp $line;
+
+		next if !$in_image && $line =~ /^(\s*#|$)/;
+
+		if (!$in_image && $line =~ /^pixel (?<c>.) (?<bg>\d+)( (?<fg>\d+))?$/) {
+			$pixels->{$+{c}} = [$+{fg}, $+{bg}];
+		} elsif (!$in_image && $line =~ /^draw$/) {
+			$in_image = true;
+			$canvas->{height} = 0;
+		} elsif ($in_image) {
+			$canvas->{height}++;
+			foreach my ($x, $c) (builtin::indexed(split //, $line)) {
+				$canvas->{width} = max($canvas->{width}, $x + 1);
+
+				my $colour = $pixels->{$c};
+				if (!defined $colour) {
+					Message::warn("$c: Pixel not defined");
+					$colour = [255, 0];
+				}
+
+				$canvas->{canvas}[$canvas->{height} - 1][$x] = Canvas::Pixel->new($colour->@*, $c);
+			}
+		}
+	}
+
+	return $canvas;
+}
+
+sub _do_put($handle, $x, $y, $bg, $fg, $char) {
+	$handle->push_write(json => {
+		command => "canvas-put",
+		coordinate => {
+			x => $x,
+			y => $y,
+		},
+		pixel => {
+			fg => $fg,
+			bg => $bg,
+			char => $char,
+		},
+	});
+}
+
+sub _coord_to_text($x, $y) {
+	my @n;
+	while ($x > 0) {
+		unshift @n, ['a' .. 'z']->[$x % 26];
+		$x = int($x / 26);
+	}
+
+	if (!@n) {
+		push @n, 'a';
+	}
+
+	return join '', @n, $y;
+}
+
+sub _do_push($handle, $img, $done) {
+	my @queue;
+	$img->for_each_pixel(sub ($x, $y, $pixel) {
+		push @queue, [$x, $y, $pixel->@{'bg', 'fg', 'char'}];
+	});
+
+	my $timeout_warned = false;
+
+	my $loop;
+	$loop = sub () {
+		if (!@queue) {
+			return $done->($handle);
+		}
+
+		my $pixel = shift @queue;
+		_do_put($handle, $pixel->@*);
+		$handle->push_read(json => sub ($handle, $data) {
+			if ($data->{timeout}) {
+				if (!$timeout_warned) {
+					Message::warn("This push is subjected to timeout");
+					$timeout_warned = true;
+				}
+
+				$handle->push_read(json => __SUB__);
+			} elsif ($data->{error}) {
+				Client::_msg_is_ok($data);
+				$::CV->send(1);
+			} else {
+				$loop->();
+			}
+		});
+	};
+
+	$loop->();
+}
+
+$Client::COMMANDS = {
+	show => {
+		validate => sub ($args) {
+			return $args->@* == 0;
+		},
+
+		usage => <<~EOS,
+		$0 show
+		EOS
+
+		exec => sub ($handle) {
+			$handle->push_write(json => {
+				command => "canvas-get-all",
+			});
+
+			$handle->push_read(json => sub ($handle, $data) {
+				Client::_msg_is_ok($data)
+					and Client::_draw_canvas($data, $::OPTIONS->{guides});
+				$::CV->send(0);
+			});
+		},
+	},
+
+	put => {
+		validate => sub ($args) {
+			return if $args->@* != 2 && $args->@* != 4;
+
+			$args->[3] = Encode::decode('utf-8', $args->[3])
+				if defined $args->[3];
+
+			splice $args->@*, 0, scalar($args->@*), _validate_put($args->@*);
+			return $args->@*;
+		},
+
+		usage => <<~EOS,
+		$0 put (XY|YX) BG [FG CHAR]
+		EOS
+
+		exec => sub ($handle, $x, $y, $bg, $fg, $char) {
+			my $waits = 0;
+			my ($loop, $async_read);
+
+			$async_read = sub ($handle, $data) {
+				if ($::OPTIONS->{wait} && defined $data->{timeout}) {
+					Message::info("Timeout: Waiting for ", Message::_paint(1, $data->{timeout}), " seconds");
+
+					Message::warn("Multiple requests get delayed by the same timeout")
+						if $waits == 1;
+
+					++$waits;
+					Coro::AnyEvent::sleep($data->{timeout});
+					return $loop->();
+				}
+
+				if (!Client::_msg_is_ok($data)) {
+					$::CV->send(1);
+					return;
+				}
+
+				if ($::OPTIONS->{quiet}) {
+					$::CV->send(0);
+				} else {
+					$Client::COMMANDS->{show}{exec}($handle);
+				}
+			};
+
+			$loop = sub () {
+				_do_put($handle, $x, $y, $bg, $fg, $char);
+
+				$handle->push_read(json => sub ($handle, $data) {
+					async_pool {
+						$async_read->($handle, $data)
+					};
+				});
+			};
+
+			$loop->();
+		},
+	},
+
+	push => {
+		validate => sub ($args) {
+			return if $args->@* != 1;
+			$args->[0] = _load_canvas($args->[0]);
+			return true;
+		},
+
+		usage => <<~EOS,
+		$0 load FILENAME
+		EOS
+
+		exec => sub ($handle, $img) {
+			$::OPTIONS->{wait} = true;
+			$::OPTIONS->{quiet} = true;
+
+			$handle->push_write(json => {
+				command => "canvas-push-start",
+			});
+
+			$handle->push_read(json => sub ($handle, $data) {
+				if (!Client::_msg_is_ok($data)) {
+					$::CV->send(1);
+					return;
+				}
+
+				_do_push($handle, $img, sub ($handle) {
+					$handle->push_write(json => {
+						command => "canvas-push-stop",
+					});
+
+					$handle->push_read(json => sub ($handle, $data) {
+						$::CV->send(Client::_msg_is_ok($data) ? 0 : 1);
+					});
+				});
+			});
+
+		},
+	},
+
+	watch => {
+		validate => sub ($args) {
+			return $args->@* == 1 && $args->[0] =~ /^(changes|canvas)$/;
+		},
+
+		usage => <<~EOS,
+		$0 watch <changes|canvas>
+		EOS
+
+		exec => sub ($handle, $what) {
+			$handle->push_write(json => {
+				command => "canvas-subscribe",
+			});
+
+			if ($what eq 'canvas') {
+				$handle->push_write(json => {
+					command => "canvas-get-all",
+				});
+			}
+
+			$::WATCHES->{cb}->{show} = sub ($handle, $data) {
+				return unless defined $data->{pixels};
+				Client::_draw_canvas($data, $::OPTIONS->{guides});
+			};
+
+			$::WATCHES->{cb}->{subscribe} = sub ($handle, $data) {
+				return unless defined $data->{update};
+
+				if ($what eq 'changes') {
+					my $login = $data->{user}{name};
+
+					my $time = DateTime->from_epoch(
+						epoch => $data->{time}[0] + $data->{time}[1] / 1_000_000,
+						time_zone => 'local',
+					);
+
+					my $strtime = $time->strftime("%T.%3N");
+
+					if ($data->{put}) {
+						my ($x, $y) = $data->{coordinates}->@{'x', 'y'};
+						my ($fg, $bg, $char) = $data->{pixel}->@{'fg', 'bg', 'char'};
+						my $coord = _coord_to_text($x, $y);
+						Message::info("$strtime $login has put '", Message::_paint("38;5;${fg};48;5;${bg}", $char), "' ($fg on $bg) at [$x, $y] ($coord)");
+					} else {
+						Message::info("$strtime $login has pushed ", Message::_paint(1, $data->{push}), " pixels in bulk");
+					}
+				} else {
+					$handle->push_write(json => {
+						command => "canvas-get-all",
+					});
+				}
+			};
+		},
+	},
+};
+
+sub connect($cmd, $args, @fh) {
+	Message::fatal("Cannot bind to '$::OPTIONS->{connect}': $!")
+		unless @fh;
+
+	$Client::HANDLE = AnyEvent::Handle->new(
+		fh => $fh[0],
+		json => JSON::PP->new->utf8(true)->core_bools(true),
+
+		on_error => sub ($handle, $fatal, $message) {
+			Message::error($message);
+			$::CV->send(1);
+		},
+
+		on_read => sub ($handle) {
+			$handle->push_read(json => sub ($handle, $data) {
+				if (!Client::_msg_is_ok($data)) {
+					$::CV->send(1);
+					return;
+				}
+
+				if (!$::WATCHES->{cb}->%*) {
+					Message::warn("Unhandled message from server");
+					say STDERR Dumper($data);
+				}
+
+				async_pool {
+					foreach my $cb (values $::WATCHES->{cb}->%*) {
+						$cb->($handle, $data);
+					}
+				};
+			});
+		},
+	);
+
+	$Client::HANDLE->push_read(json => sub ($handle, $data) {
+		if (Client::_msg_is_ok($data)) {
+			async_pool {
+				$cmd->{exec}($Client::HANDLE, $args->@*);
+			};
+		} else {
+			$::CV->send(1);
+		}
+	});
+}
+
+
+package main;
+
+use AnyEvent;
+use AnyEvent::Handle;
+use AnyEvent::Socket;
+use Coro;
+use Getopt::Long qw{:config no_auto_abbrev no_ignore_case};
+use Pod::Usage;
+
+use Canvas;
+use Settings;
+use Validate;
+
+
+$::OPTIONS = {
+	connect => $Settings::DEFAULT_SOCKET_PATH,
+	guides => true,
+};
+
+GetOptions($::OPTIONS, qw{
+	h help man
+	connect|c=s
+	guides!
+	quiet|q
+	wait|w
+}) or exit 1;
+
+foreach my ($i, $v) (builtin::indexed qw{h help man}) {
+	pod2usage(-verbose => $i, -exitval => 0) if $::OPTIONS->{$v};
+}
+
+pod2usage if @ARGV == 0;
+
+# Process commands that do not need socket.
+if ($ARGV[0] =~ /^colou?rs$/) {
+	Static::colours();
+	exit 0;
+}
+
+if ($ARGV[0] eq 'help' || !defined $Client::COMMANDS->{$ARGV[0]}) {
+	pod2usage(-exitval => 0, -verbose => 2);
+}
+
+# Validate arguments of parametrized commands before we waste server's time.
+my $cmd = $Client::COMMANDS->{$ARGV[0]};
+my $args = [ @ARGV[1 .. $#ARGV] ];
+
+if (!$cmd->{validate}($args)) {
+	Message::usage($cmd->{usage});
+	exit 1;
+}
+
+# All the following commands pass the request to the daemon and thus
+# need an active socket connection.
+$::CV = AnyEvent->condvar;
+
+$::WATCHES = {
+	cb => {},
+};
+
+if ($::OPTIONS->{connect} =~ /^(?<host>\w+):(?<port>\d+)$/) {
+	$::WATCHES->{client} = tcp_connect($+{host}, $+{port},
+		sub (@fh) { Client::connect($cmd, $args, @fh); }
+	);
+} else {
+	$::WATCHES->{client} = tcp_connect("unix/", $::OPTIONS->{connect},
+		sub (@fh) { Client::connect($cmd, $args, @fh); }
+	);
+}
+
+exit $::CV->recv;

@@ -33,7 +33,7 @@ def sanitize_input(serialized_pixel):
 def write_pixel(serialized_pixel):
     sanitized_pixel = sanitize_input(serialized_pixel)
 
-    pixel_command = f"artscii put {sanitized_pixel}"
+    pixel_command = f"perl artscii_command/artscii put {sanitized_pixel}"
 
     print(pixel_command)
 
@@ -66,8 +66,8 @@ while True:
     
     wrote = False
     for pixel in data:
-        if not is_pixel_correct(pixel.x, pixel.y, pixel.bg, pixel.fg):
-            continue
+        # if not is_pixel_correct(pixel.x, pixel.y, pixel.bg, pixel.fg):
+        #     continue
         wrote = True
         write_pixel(pixel)
         time.sleep(wait_time)

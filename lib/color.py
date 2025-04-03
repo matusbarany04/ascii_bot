@@ -267,11 +267,33 @@ raw[253] = "#dadada"
 raw[254] = "#e4e4e4"
 raw[255] = "#eeeeee"
 
-def get_hex_index(hex_color):
+
+def get_closest_color(hex: str):
+    r = int(hex[1:3], 16)
+    g = int(hex[3:5], 16)
+    b = int(hex[5:7], 16)
+
+    closest_index = 0
+    closest_distance = float('inf')
+
+    for i, color in enumerate(raw):
+        cr = int(color[1:3], 16)
+        cg = int(color[3:5], 16)
+        cb = int(color[5:7], 16)
+
+        distance = abs(r - cr) + abs(g - cg) + abs(b - cb)
+
+        if distance < closest_distance:
+            closest_index = i
+            closest_distance = distance
+
+    return closest_index
+
+def get_hex_index(hex_color, pick_closest=False):
     if hex_color in raw:
         return raw.index(hex_color)
     else:
-        return -1
+        return get_closest_color(hex_color)
 
 def get_raw_color(index):
     return raw[index]

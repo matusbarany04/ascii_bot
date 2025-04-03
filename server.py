@@ -4,8 +4,8 @@ from lib.image_reader import ImageReader
 from rplace import Rplace
 
 virtual_rplace = True
-image_name = "bestie.png"
-x_offset = 0
+image_name = "brandejs20.png"
+x_offset = 10
 y_offset = 0
 
 app = Flask(__name__)
