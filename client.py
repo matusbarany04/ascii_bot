@@ -3,9 +3,9 @@ import time
 import os
 import re
 
-debug = True
+debug = False
 url = "http://127.0.0.1:5000"
-wait_time = 60
+wait_time = 1
 
 def fetch_image():
     response = requests.get(url + "/data")
